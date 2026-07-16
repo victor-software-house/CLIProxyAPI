@@ -5,8 +5,28 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"gopkg.in/yaml.v3"
 )
+
+func TestRuntimeConfigFromConfigUsesConstructedHostValues(t *testing.T) {
+	instance, errNew := sdkconfig.NewPluginInstanceConfig(true, 5, map[string]any{"setting": "value"})
+	if errNew != nil {
+		t.Fatalf("NewPluginInstanceConfig() error = %v", errNew)
+	}
+	enabled := false
+	instance.Enabled = &enabled
+	instance.Priority = 9
+	cfg := &config.Config{Plugins: config.PluginsConfig{Configs: map[string]config.PluginInstanceConfig{"sample": instance}}}
+
+	var got map[string]any
+	if errDecode := yaml.Unmarshal(runtimeConfigFromConfig(cfg).Items["sample"].ConfigYAML, &got); errDecode != nil {
+		t.Fatalf("yaml.Unmarshal() error = %v", errDecode)
+	}
+	if got["setting"] != "value" || got["enabled"] != false || got["priority"] != 9 {
+		t.Fatalf("decoded runtime config has unexpected fields")
+	}
+}
 
 func TestRuntimeConfigYAMLAddsHostDefaultsToRawPluginConfig(t *testing.T) {
 	var node yaml.Node

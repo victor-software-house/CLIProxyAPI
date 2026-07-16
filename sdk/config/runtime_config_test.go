@@ -6,6 +6,18 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
+func TestPluginInstanceConfigConstruction(t *testing.T) {
+	instance, errNew := config.NewPluginInstanceConfig(true, 3, map[string]any{"endpoint": "https://plugin.example/v1"})
+	if errNew != nil {
+		t.Fatalf("NewPluginInstanceConfig() error = %v", errNew)
+	}
+	cfg := config.Config{Plugins: config.PluginsConfig{Configs: map[string]config.PluginInstanceConfig{"example": instance}}}
+	got := cfg.Plugins.Configs["example"]
+	if got.Enabled == nil || !*got.Enabled || got.Priority != 3 {
+		t.Fatalf("host fields = (%v, %d), want (true, 3)", got.Enabled, got.Priority)
+	}
+}
+
 func TestRuntimeConfigConstruction(t *testing.T) {
 	cfg := config.Config{
 		SDKConfig: config.SDKConfig{

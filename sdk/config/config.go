@@ -12,6 +12,8 @@ import (
 type SDKConfig = internalconfig.SDKConfig
 
 type Config = internalconfig.Config
+type PluginsConfig = internalconfig.PluginsConfig
+type PluginInstanceConfig = internalconfig.PluginInstanceConfig
 
 type StreamingConfig = internalconfig.StreamingConfig
 type TLSConfig = internalconfig.TLSConfig
