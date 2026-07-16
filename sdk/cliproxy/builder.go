@@ -29,6 +29,9 @@ type Builder struct {
 	// configPath is the path to the configuration file.
 	configPath string
 
+	// inMemoryMode disables configuration-file lifecycle while preserving auth watching.
+	inMemoryMode bool
+
 	// tokenProvider handles loading token-based clients.
 	tokenProvider TokenClientProvider
 
@@ -103,6 +106,12 @@ func (b *Builder) WithConfig(cfg *config.Config) *Builder {
 //   - *Builder: The builder instance for method chaining
 func (b *Builder) WithConfigPath(path string) *Builder {
 	b.configPath = path
+	return b
+}
+
+// WithInMemoryMode configures the service without config-file lifecycle management.
+func (b *Builder) WithInMemoryMode() *Builder {
+	b.inMemoryMode = true
 	return b
 }
 
@@ -184,8 +193,15 @@ func (b *Builder) Build() (*Service, error) {
 	if b.cfg == nil {
 		return nil, fmt.Errorf("cliproxy: configuration is required")
 	}
-	if b.configPath == "" {
+	if b.configPath == "" && !b.inMemoryMode {
 		return nil, fmt.Errorf("cliproxy: configuration path is required")
+	}
+
+	cfg := b.cfg
+	configPath := b.configPath
+	if b.inMemoryMode {
+		cfg = b.cfg.CloneForRuntime()
+		configPath = ""
 	}
 
 	tokenProvider := b.tokenProvider
@@ -213,35 +229,28 @@ func (b *Builder) Build() (*Service, error) {
 		accessManager = sdkaccess.NewManager()
 	}
 
-	configaccess.Register(&b.cfg.SDKConfig)
+	configaccess.Register(&cfg.SDKConfig)
 	pluginHost := b.pluginHost
 	if pluginHost == nil {
 		pluginHost = pluginhost.New()
 	}
-	if b.cfg != nil {
-		pluginHost.ApplyConfig(context.Background(), b.cfg)
-		pluginHost.RegisterFrontendAuthProviders()
-	}
+	pluginHost.ApplyConfig(context.Background(), cfg)
+	pluginHost.RegisterFrontendAuthProviders()
 	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
 	coreManager := b.coreManager
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
-		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
-			dirSetter.SetBaseDir(b.cfg.AuthDir)
+		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
+			dirSetter.SetBaseDir(cfg.AuthDir)
 		}
 
-		strategy := ""
-		sessionAffinity := false
+		strategy := strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy))
+		sessionAffinity := cfg.Routing.SessionAffinity
 		sessionAffinityTTL := time.Hour
-		if b.cfg != nil {
-			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
-			// Support both legacy ClaudeCodeSessionAffinity and new universal SessionAffinity
-			sessionAffinity = b.cfg.Routing.SessionAffinity
-			if ttlStr := strings.TrimSpace(b.cfg.Routing.SessionAffinityTTL); ttlStr != "" {
-				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
-					sessionAffinityTTL = parsed
-				}
+		if ttlStr := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttlStr != "" {
+			if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
+				sessionAffinityTTL = parsed
 			}
 		}
 		var selector coreauth.Selector
@@ -264,15 +273,16 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
-	coreManager.SetConfig(b.cfg)
-	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
+	coreManager.SetConfig(cfg)
+	coreManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
 	if pluginHost != nil {
 		coreManager.SetPluginScheduler(pluginHost)
 	}
 
 	service := &Service{
-		cfg:            b.cfg,
-		configPath:     b.configPath,
+		cfg:            cfg,
+		configPath:     configPath,
+		inMemoryMode:   b.inMemoryMode,
 		tokenProvider:  tokenProvider,
 		apiKeyProvider: apiKeyProvider,
 		watcherFactory: watcherFactory,
@@ -289,10 +299,12 @@ func (b *Builder) Build() (*Service, error) {
 	service.serverOptions = append(service.serverOptions,
 		api.WithPostAuthPersistHook(service.runtimeAuthSyncHook()),
 		api.WithPluginHost(pluginHost),
-		api.WithConfigReloadHook(func(_ context.Context, _ *config.Config) {
-			service.reloadConfigFromWatcher()
-		}),
 	)
+	if !b.inMemoryMode {
+		service.serverOptions = append(service.serverOptions, api.WithConfigReloadHook(func(_ context.Context, _ *config.Config) {
+			service.reloadConfigFromWatcher()
+		}))
+	}
 	return service, nil
 }
 

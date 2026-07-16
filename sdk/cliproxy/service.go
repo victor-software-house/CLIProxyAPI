@@ -51,6 +51,9 @@ type Service struct {
 	// configPath is the path to the configuration file.
 	configPath string
 
+	// inMemoryMode disables configuration-file lifecycle while preserving auth watching.
+	inMemoryMode bool
+
 	// tokenProvider handles loading token-based clients.
 	tokenProvider TokenClientProvider
 
@@ -1356,7 +1359,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 }
 
 func (s *Service) reloadConfigFromWatcher() bool {
-	if s == nil || s.watcher == nil {
+	if s == nil || s.inMemoryMode || s.watcher == nil {
 		return false
 	}
 	return s.watcher.ReloadConfigIfChanged()
@@ -1739,7 +1742,10 @@ func (s *Service) Run(ctx context.Context) error {
 
 	if !homeEnabled {
 		var watcherWrapper *WatcherWrapper
-		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
+		var reloadCallback func(*config.Config)
+		if !s.inMemoryMode {
+			reloadCallback = func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
+		}
 
 		watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
 		if errCreate != nil {

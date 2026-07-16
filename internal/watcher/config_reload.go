@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -27,6 +28,9 @@ func (w *Watcher) stopConfigReloadTimer() {
 }
 
 func (w *Watcher) scheduleConfigReload() {
+	if strings.TrimSpace(w.configPath) == "" {
+		return
+	}
 	w.configReloadMu.Lock()
 	defer w.configReloadMu.Unlock()
 	if w.configReloadTimer != nil {
@@ -49,6 +53,9 @@ func (w *Watcher) ReloadConfigIfChanged() {
 }
 
 func (w *Watcher) reloadConfigIfChanged() {
+	if strings.TrimSpace(w.configPath) == "" {
+		return
+	}
 	data, err := os.ReadFile(w.configPath)
 	if err != nil {
 		log.Errorf("failed to read config file for hash check: %v", err)
@@ -86,6 +93,9 @@ func (w *Watcher) reloadConfigIfChanged() {
 }
 
 func (w *Watcher) reloadConfig() bool {
+	if strings.TrimSpace(w.configPath) == "" {
+		return false
+	}
 	log.Debug("=========================== CONFIG RELOAD ============================")
 	log.Debugf("starting config reload from: %s", w.configPath)
 
