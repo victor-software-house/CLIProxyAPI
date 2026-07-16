@@ -1,6 +1,7 @@
 name: VSH fork release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v7.*-claudex.*"
