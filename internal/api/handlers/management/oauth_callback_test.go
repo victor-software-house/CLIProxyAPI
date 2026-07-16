@@ -116,6 +116,83 @@ func TestGetOAuthCallbackDoesNotAliasPluginProvider(t *testing.T) {
 	}
 }
 
+func TestConsumeOAuthCallbackFileRetriesMalformedPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "callback.oauth")
+	if errWrite := os.WriteFile(path, []byte("{"), 0o600); errWrite != nil {
+		t.Fatalf("write malformed callback: %v", errWrite)
+	}
+
+	_, ready, errConsume := consumeOAuthCallbackFile(path)
+	if errConsume == nil {
+		t.Fatal("consume malformed callback error = nil")
+	}
+	if ready {
+		t.Fatal("consume malformed callback ready = true")
+	}
+	if _, errStat := os.Stat(path); errStat != nil {
+		t.Fatalf("malformed callback file was removed: %v", errStat)
+	}
+
+	want := oauthCallbackFilePayload{Code: "test-code", State: "test-state"}
+	data, errMarshal := json.Marshal(want)
+	if errMarshal != nil {
+		t.Fatalf("marshal callback payload: %v", errMarshal)
+	}
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatalf("write callback payload: %v", errWrite)
+	}
+
+	got, ready, errConsume := consumeOAuthCallbackFile(path)
+	if errConsume != nil {
+		t.Fatalf("consume callback payload: %v", errConsume)
+	}
+	if !ready {
+		t.Fatal("consume callback payload ready = false")
+	}
+	if got != want {
+		t.Fatalf("callback payload = %+v, want %+v", got, want)
+	}
+	if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("valid callback file was not removed: %v", errStat)
+	}
+}
+
+func TestWriteOAuthCallbackFilePublishesCompletePayload(t *testing.T) {
+	authDir := t.TempDir()
+	path, errWrite := WriteOAuthCallbackFile(authDir, "anthropic", "test-anthropic-state", "test-code", "")
+	if errWrite != nil {
+		t.Fatalf("write callback file: %v", errWrite)
+	}
+
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read callback file: %v", errRead)
+	}
+	var got oauthCallbackFilePayload
+	if errUnmarshal := json.Unmarshal(data, &got); errUnmarshal != nil {
+		t.Fatalf("decode callback payload: %v", errUnmarshal)
+	}
+	want := oauthCallbackFilePayload{Code: "test-code", State: "test-anthropic-state"}
+	if got != want {
+		t.Fatalf("callback payload = %+v, want %+v", got, want)
+	}
+
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		t.Fatalf("stat callback file: %v", errStat)
+	}
+	if gotMode := info.Mode().Perm(); gotMode != 0o600 {
+		t.Fatalf("callback file mode = %04o, want %04o", gotMode, 0o600)
+	}
+	entries, errReadDir := os.ReadDir(authDir)
+	if errReadDir != nil {
+		t.Fatalf("read callback directory: %v", errReadDir)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		t.Fatalf("callback directory entries = %+v, want only %q", entries, filepath.Base(path))
+	}
+}
+
 func TestWriteOAuthCallbackFileForPendingSessionCreatesMissingAuthDirForCallbackProviders(t *testing.T) {
 	// xAI uses device-code flow and no longer writes callback files.
 	providers := []string{"anthropic", "codex", "gemini", "antigravity"}

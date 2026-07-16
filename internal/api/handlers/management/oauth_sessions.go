@@ -419,6 +419,25 @@ func WriteOAuthCallbackFile(authDir, provider, state, code, errorMessage string)
 	return writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessage)
 }
 
+func consumeOAuthCallbackFile(path string) (oauthCallbackFilePayload, bool, error) {
+	data, errRead := os.ReadFile(path)
+	if errors.Is(errRead, os.ErrNotExist) {
+		return oauthCallbackFilePayload{}, false, nil
+	}
+	if errRead != nil {
+		return oauthCallbackFilePayload{}, false, fmt.Errorf("read oauth callback file: %w", errRead)
+	}
+
+	var payload oauthCallbackFilePayload
+	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+		return oauthCallbackFilePayload{}, false, fmt.Errorf("decode oauth callback file: %w", errUnmarshal)
+	}
+	if errRemove := os.Remove(path); errRemove != nil {
+		return oauthCallbackFilePayload{}, false, fmt.Errorf("remove oauth callback file: %w", errRemove)
+	}
+	return payload, true, nil
+}
+
 func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessage string) (string, error) {
 	if strings.TrimSpace(authDir) == "" {
 		return "", fmt.Errorf("auth dir is empty")
@@ -441,13 +460,36 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 		State: strings.TrimSpace(state),
 		Error: strings.TrimSpace(errorMessage),
 	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("marshal oauth callback payload: %w", err)
+	data, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return "", fmt.Errorf("marshal oauth callback payload: %w", errMarshal)
 	}
-	if err := os.WriteFile(filePath, data, 0o600); err != nil {
-		return "", fmt.Errorf("write oauth callback file: %w", err)
+
+	temp, errCreate := os.CreateTemp(authDir, ".oauth-callback-*")
+	if errCreate != nil {
+		return "", fmt.Errorf("create oauth callback temp file: %w", errCreate)
 	}
+	tempPath := temp.Name()
+	published := false
+	defer func() {
+		if !published {
+			_ = temp.Close()
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if errChmod := temp.Chmod(0o600); errChmod != nil {
+		return "", fmt.Errorf("set oauth callback temp file mode: %w", errChmod)
+	}
+	if _, errWrite := temp.Write(data); errWrite != nil {
+		return "", fmt.Errorf("write oauth callback temp file: %w", errWrite)
+	}
+	if errClose := temp.Close(); errClose != nil {
+		return "", fmt.Errorf("close oauth callback temp file: %w", errClose)
+	}
+	if errRename := os.Rename(tempPath, filePath); errRename != nil {
+		return "", fmt.Errorf("publish oauth callback file: %w", errRename)
+	}
+	published = true
 	return filePath, nil
 }
 

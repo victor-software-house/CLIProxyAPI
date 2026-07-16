@@ -100,6 +100,16 @@ func waitForOAuthSessionCompletion(t *testing.T, state, provider string) {
 	t.Fatalf("timed out waiting for %s OAuth session %s", provider, state)
 }
 
+func waitForOAuthCodeExchange(t *testing.T, provider string, exchangeStarted <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-exchangeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s OAuth code exchange", provider)
+	}
+}
+
 func TestOAuthStartPathsUseHandlerHTTPClient(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	authDir := t.TempDir()
@@ -135,14 +145,14 @@ func TestOAuthStartPathsUseHandlerHTTPClient(t *testing.T) {
 	if _, err := WriteOAuthCallbackFileForPendingSession(authDir, "anthropic", claudeState, "test-code", ""); err != nil {
 		t.Fatalf("write Claude callback: %v", err)
 	}
-	<-claudeExchangeStarted
+	waitForOAuthCodeExchange(t, "Claude", claudeExchangeStarted)
 	waitForOAuthSessionCompletion(t, claudeState, "anthropic")
 
 	codexState := requestOAuthStart(t, handler.RequestCodexToken)
 	if _, err := WriteOAuthCallbackFileForPendingSession(authDir, "codex", codexState, "test-code", ""); err != nil {
 		t.Fatalf("write Codex callback: %v", err)
 	}
-	<-codexExchangeStarted
+	waitForOAuthCodeExchange(t, "Codex", codexExchangeStarted)
 	waitForOAuthSessionCompletion(t, codexState, "codex")
 
 	xaiRecorder := httptest.NewRecorder()

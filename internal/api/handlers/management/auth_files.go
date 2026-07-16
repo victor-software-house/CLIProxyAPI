@@ -2006,22 +2006,21 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 		// Helper: wait for callback file
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
-		waitForFile := func(path string, timeout time.Duration) (map[string]string, error) {
+		waitForFile := func(path string, timeout time.Duration) (oauthCallbackFilePayload, error) {
 			deadline := time.Now().Add(timeout)
 			for {
 				if !IsOAuthSessionPending(state, "anthropic") {
-					return nil, errOAuthSessionNotPending
+					return oauthCallbackFilePayload{}, errOAuthSessionNotPending
 				}
 				if time.Now().After(deadline) {
 					SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
-					return nil, fmt.Errorf("timeout waiting for OAuth callback")
+					return oauthCallbackFilePayload{}, fmt.Errorf("timeout waiting for OAuth callback")
 				}
-				data, errRead := os.ReadFile(path)
-				if errRead == nil {
-					var m map[string]string
-					_ = json.Unmarshal(data, &m)
-					_ = os.Remove(path)
-					return m, nil
+				payload, ready, errConsume := consumeOAuthCallbackFile(path)
+				if errConsume != nil {
+					log.WithError(errConsume).Debug("failed to consume OAuth callback file")
+				} else if ready {
+					return payload, nil
 				}
 				time.Sleep(500 * time.Millisecond)
 			}
@@ -2029,7 +2028,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 		fmt.Println("Waiting for authentication callback...")
 		// Wait up to 5 minutes
-		resultMap, errWait := waitForFile(waitFile, 5*time.Minute)
+		payload, errWait := waitForFile(waitFile, 5*time.Minute)
 		if errWait != nil {
 			if errors.Is(errWait, errOAuthSessionNotPending) {
 				return
@@ -2038,21 +2037,21 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			log.Error(claude.GetUserFriendlyMessage(authErr))
 			return
 		}
-		if errStr := resultMap["error"]; errStr != "" {
+		if errStr := payload.Error; errStr != "" {
 			oauthErr := claude.NewOAuthError(errStr, "", http.StatusBadRequest)
 			log.Error(claude.GetUserFriendlyMessage(oauthErr))
 			SetOAuthSessionError(state, "Bad request")
 			return
 		}
-		if resultMap["state"] != state {
-			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, resultMap["state"]))
+		if payload.State != state {
+			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, payload.State))
 			log.Error(claude.GetUserFriendlyMessage(authErr))
 			SetOAuthSessionError(state, "State code error")
 			return
 		}
 
 		// Parse code (Claude may append state after '#')
-		rawCode := resultMap["code"]
+		rawCode := payload.Code
 		code := strings.Split(rawCode, "#")[0]
 
 		// Exchange code for tokens using internal auth service
@@ -2165,23 +2164,23 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
 				return
 			}
-			if data, errR := os.ReadFile(waitFile); errR == nil {
-				var m map[string]string
-				_ = json.Unmarshal(data, &m)
-				_ = os.Remove(waitFile)
-				if errStr := m["error"]; errStr != "" {
+			payload, ready, errConsume := consumeOAuthCallbackFile(waitFile)
+			if errConsume != nil {
+				log.WithError(errConsume).Debug("failed to consume OAuth callback file")
+			} else if ready {
+				if errStr := payload.Error; errStr != "" {
 					oauthErr := codex.NewOAuthError(errStr, "", http.StatusBadRequest)
 					log.Error(codex.GetUserFriendlyMessage(oauthErr))
 					SetOAuthSessionError(state, "Bad Request")
 					return
 				}
-				if m["state"] != state {
-					authErr := codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, m["state"]))
+				if payload.State != state {
+					authErr := codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, payload.State))
 					SetOAuthSessionError(state, "State code error")
 					log.Error(codex.GetUserFriendlyMessage(authErr))
 					return
 				}
-				code = m["code"]
+				code = payload.Code
 				break
 			}
 			time.Sleep(500 * time.Millisecond)
@@ -2296,21 +2295,21 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 				SetOAuthSessionError(state, "OAuth flow timed out")
 				return
 			}
-			if data, errReadFile := os.ReadFile(waitFile); errReadFile == nil {
-				var payload map[string]string
-				_ = json.Unmarshal(data, &payload)
-				_ = os.Remove(waitFile)
-				if errStr := strings.TrimSpace(payload["error"]); errStr != "" {
+			payload, ready, errConsume := consumeOAuthCallbackFile(waitFile)
+			if errConsume != nil {
+				log.WithError(errConsume).Debug("failed to consume OAuth callback file")
+			} else if ready {
+				if errStr := strings.TrimSpace(payload.Error); errStr != "" {
 					log.Errorf("Authentication failed: %s", errStr)
 					SetOAuthSessionError(state, "Authentication failed")
 					return
 				}
-				if payloadState := strings.TrimSpace(payload["state"]); payloadState != "" && payloadState != state {
+				if payloadState := strings.TrimSpace(payload.State); payloadState != "" && payloadState != state {
 					log.Errorf("Authentication failed: state mismatch")
 					SetOAuthSessionError(state, "Authentication failed: state mismatch")
 					return
 				}
-				authCode = strings.TrimSpace(payload["code"])
+				authCode = strings.TrimSpace(payload.Code)
 				if authCode == "" {
 					log.Error("Authentication failed: code not found")
 					SetOAuthSessionError(state, "Authentication failed: code not found")
