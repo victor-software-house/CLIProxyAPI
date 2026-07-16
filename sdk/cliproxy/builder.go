@@ -305,6 +305,11 @@ func (b *Builder) Build() (*Service, error) {
 			service.reloadConfigFromWatcher()
 		}))
 	}
+	initialHash, errHash := configHash(cfg)
+	if errHash != nil {
+		return nil, errHash
+	}
+	service.configSnapshot = ConfigApplyResult{ConfigHash: initialHash, AppliedAt: time.Now().UTC()}
 	return service, nil
 }
 

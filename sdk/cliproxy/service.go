@@ -48,6 +48,8 @@ type Service struct {
 	// configUpdateMu serializes config updates across watcher + home.
 	configUpdateMu sync.Mutex
 
+	configSnapshot ConfigApplyResult
+
 	// configPath is the path to the configuration file.
 	configPath string
 
@@ -1258,7 +1260,10 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 
 	s.configUpdateMu.Lock()
 	defer s.configUpdateMu.Unlock()
+	s.applyConfigUpdateWithAuthSynthesisLocked(newCfg, synthesizeConfigAuths)
+}
 
+func (s *Service) applyConfigUpdateWithAuthSynthesisLocked(newCfg *config.Config, synthesizeConfigAuths bool) {
 	previousStrategy := ""
 	var previousSessionAffinity bool
 	var previousSessionAffinityTTL string
