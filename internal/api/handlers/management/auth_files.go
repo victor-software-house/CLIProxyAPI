@@ -53,10 +53,22 @@ type callbackForwarder struct {
 	done     chan struct{}
 }
 
+type claudeOAuthService interface {
+	GenerateAuthURL(state string, pkceCodes *claude.PKCECodes) (string, string, error)
+	ExchangeCodeForTokens(ctx context.Context, code, state string, pkceCodes *claude.PKCECodes) (*claude.ClaudeAuthBundle, error)
+	CreateTokenStorage(bundle *claude.ClaudeAuthBundle) *claude.ClaudeTokenStorage
+}
+
 type codexOAuthService interface {
 	GenerateAuthURL(state string, pkceCodes *codex.PKCECodes) (string, error)
 	ExchangeCodeForTokens(ctx context.Context, code string, pkceCodes *codex.PKCECodes) (*codex.CodexAuthBundle, error)
 	CreateTokenStorage(bundle *codex.CodexAuthBundle) *codex.CodexTokenStorage
+}
+
+type xaiOAuthService interface {
+	StartDeviceFlow(ctx context.Context) (*xaiauth.DeviceCodeResponse, error)
+	WaitForAuthorization(ctx context.Context, deviceCode *xaiauth.DeviceCodeResponse) (*xaiauth.AuthBundle, error)
+	CreateTokenStorage(bundle *xaiauth.AuthBundle) *xaiauth.TokenStorage
 }
 
 var (
@@ -65,8 +77,28 @@ var (
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
 	errAuthFileNotFound   = errors.New("auth file not found")
 	errPluginVirtualAuth  = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
-	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
+	newClaudeOAuthService = func(cfg *config.Config, httpClient *http.Client) claudeOAuthService {
+		return claude.NewClaudeAuthWithHTTPClient(cfg, httpClient)
+	}
+	newCodexOAuthService = func(cfg *config.Config, httpClient *http.Client) codexOAuthService {
+		return codex.NewCodexAuthWithHTTPClient(cfg, httpClient)
+	}
+	newXAIOAuthService = func(cfg *config.Config, httpClient *http.Client) xaiOAuthService {
+		return xaiauth.NewXAIAuthWithHTTPClient(cfg, httpClient)
+	}
 )
+
+func (h *Handler) newClaudeOAuthService() claudeOAuthService {
+	return newClaudeOAuthService(h.cfg, h.oauthHTTPClient)
+}
+
+func (h *Handler) newCodexOAuthService() codexOAuthService {
+	return newCodexOAuthService(h.cfg, h.oauthHTTPClient)
+}
+
+func (h *Handler) newXAIOAuthService() xaiOAuthService {
+	return newXAIOAuthService(h.cfg, h.oauthHTTPClient)
+}
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
@@ -1932,7 +1964,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}
 
 	// Initialize Claude auth service
-	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	anthropicAuth := h.newClaudeOAuthService()
 
 	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
@@ -2079,7 +2111,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	// Initialize Codex auth service
-	openaiAuth := newCodexOAuthService(h.cfg)
+	openaiAuth := h.newCodexOAuthService()
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
@@ -2378,7 +2410,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 	fmt.Println("Initializing xAI authentication...")
 
 	state := fmt.Sprintf("xai-%d", time.Now().UnixNano())
-	authSvc := xaiauth.NewXAIAuth(h.cfg)
+	authSvc := h.newXAIOAuthService()
 
 	deviceFlow, errStartDeviceFlow := authSvc.StartDeviceFlow(ctx)
 	if errStartDeviceFlow != nil {

@@ -6,6 +6,7 @@ package api
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 	internalmanagement "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
@@ -36,14 +37,14 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 }
 
 // NewHandlerWithoutConfigFilePath creates a management handler that skips config file persistence.
-func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager) *Handler {
-	return internalmanagement.NewHandlerWithoutConfigFilePath(cfg, manager)
+func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager, client *http.Client) *Handler {
+	return internalmanagement.NewHandlerWithoutConfigFilePath(cfg, manager, client)
 }
 
 // NewManagementTokenRequester creates a limited management handler exposing only token request endpoints.
 func NewManagementTokenRequester(cfg *config.Config, manager *coreauth.Manager) ManagementTokenRequester {
 	return &managementTokenRequester{
-		handler: NewHandlerWithoutConfigFilePath(cfg, manager),
+		handler: NewHandlerWithoutConfigFilePath(cfg, manager, nil),
 	}
 }
 

@@ -26,6 +26,14 @@ var xaiRefreshGroup singleflight.Group
 
 // NewXAIAuth creates an xAI OAuth helper using config proxy settings.
 func NewXAIAuth(cfg *config.Config) *XAIAuth {
+	return NewXAIAuthWithHTTPClient(cfg, nil)
+}
+
+// NewXAIAuthWithHTTPClient creates an xAI OAuth helper with a caller-owned HTTP client.
+func NewXAIAuthWithHTTPClient(cfg *config.Config, httpClient *http.Client) *XAIAuth {
+	if httpClient != nil {
+		return &XAIAuth{httpClient: httpClient}
+	}
 	return NewXAIAuthWithProxyURL(cfg, "")
 }
 

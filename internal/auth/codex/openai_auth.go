@@ -40,6 +40,14 @@ var codexRefreshGroup singleflight.Group
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
 func NewCodexAuth(cfg *config.Config) *CodexAuth {
+	return NewCodexAuthWithHTTPClient(cfg, nil)
+}
+
+// NewCodexAuthWithHTTPClient creates a new CodexAuth service instance with a caller-owned HTTP client.
+func NewCodexAuthWithHTTPClient(cfg *config.Config, httpClient *http.Client) *CodexAuth {
+	if httpClient != nil {
+		return &CodexAuth{httpClient: httpClient}
+	}
 	return NewCodexAuthWithProxyURL(cfg, "")
 }
 

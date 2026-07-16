@@ -148,6 +148,14 @@ type ClaudeAuth struct {
 // Returns:
 //   - *ClaudeAuth: A new Claude authentication service instance
 func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
+	return NewClaudeAuthWithHTTPClient(cfg, nil)
+}
+
+// NewClaudeAuthWithHTTPClient creates a new Anthropic authentication service with a caller-owned HTTP client.
+func NewClaudeAuthWithHTTPClient(cfg *config.Config, httpClient *http.Client) *ClaudeAuth {
+	if httpClient != nil {
+		return &ClaudeAuth{httpClient: httpClient}
+	}
 	return NewClaudeAuthWithProxyURL(cfg, "")
 }
 

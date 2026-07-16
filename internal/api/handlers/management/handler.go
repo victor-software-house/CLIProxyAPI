@@ -58,6 +58,7 @@ type Handler struct {
 	configReloadHook        func(context.Context, *config.Config)
 	pluginStoreRegistryURL  string
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
+	oauthHTTPClient         *http.Client
 	pluginReleaseCacheMu    sync.Mutex
 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
 }
@@ -69,6 +70,10 @@ type configReloadSnapshot struct {
 
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
+	return newHandler(cfg, configFilePath, manager, nil)
+}
+
+func newHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager, oauthHTTPClient *http.Client) *Handler {
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
 
@@ -80,6 +85,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		oauthHTTPClient:     oauthHTTPClient,
 	}
 	h.startAttemptCleanup()
 	return h
@@ -115,9 +121,13 @@ func (h *Handler) purgeStaleAttempts() {
 	}
 }
 
-// NewHandler creates a new management handler instance.
-func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager) *Handler {
-	return NewHandler(cfg, "", manager)
+// NewHandlerWithoutConfigFilePath creates a management handler without config file persistence.
+func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager, oauthHTTPClients ...*http.Client) *Handler {
+	var oauthHTTPClient *http.Client
+	if len(oauthHTTPClients) > 0 {
+		oauthHTTPClient = oauthHTTPClients[0]
+	}
+	return newHandler(cfg, "", manager, oauthHTTPClient)
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.

@@ -48,7 +48,7 @@ func (f *fakeCodexOAuthService) CreateTokenStorage(bundle *codex.CodexAuthBundle
 
 func TestRequestCodexTokenCompletionKeepsConcurrentSessionPending(t *testing.T) {
 	originalNewCodexOAuthService := newCodexOAuthService
-	newCodexOAuthService = func(cfg *config.Config) codexOAuthService {
+	newCodexOAuthService = func(_ *config.Config, _ *http.Client) codexOAuthService {
 		return &fakeCodexOAuthService{}
 	}
 	defer func() {
