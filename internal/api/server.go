@@ -577,9 +577,8 @@ func (s *Server) setupRoutes() {
 		})
 	})
 
-	// OAuth callback endpoints (reuse main server port)
-	// These endpoints receive provider redirects and persist
-	// the short-lived code/state for the waiting goroutine.
+	// OAuth callback endpoints (reuse main server port).
+	// These endpoints deliver provider redirects to the waiting in-memory session.
 	s.engine.GET("/anthropic/callback", func(c *gin.Context) {
 		code := c.Query("code")
 		state := c.Query("state")
@@ -588,7 +587,7 @@ func (s *Server) setupRoutes() {
 			errStr = c.Query("error_description")
 		}
 		if state != "" {
-			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "anthropic", state, code, errStr)
+			_ = s.mgmt.SubmitOAuthCallback(managementHandlers.OAuthCallback{State: state, Code: code, Error: errStr})
 		}
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
@@ -602,7 +601,7 @@ func (s *Server) setupRoutes() {
 			errStr = c.Query("error_description")
 		}
 		if state != "" {
-			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "codex", state, code, errStr)
+			_ = s.mgmt.SubmitOAuthCallback(managementHandlers.OAuthCallback{State: state, Code: code, Error: errStr})
 		}
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
@@ -616,7 +615,7 @@ func (s *Server) setupRoutes() {
 			errStr = c.Query("error_description")
 		}
 		if state != "" {
-			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "antigravity", state, code, errStr)
+			_ = s.mgmt.SubmitOAuthCallback(managementHandlers.OAuthCallback{State: state, Code: code, Error: errStr})
 		}
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)

@@ -1,11 +1,13 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -216,12 +218,8 @@ func TestCancelOAuthSessionAndCallbackRejectAfterCancel(t *testing.T) {
 		t.Fatal("session still pending after cancel")
 	}
 
-	_, errWrite := WriteOAuthCallbackFileForPendingSession(t.TempDir(), "anthropic", "callback-state", "code", "")
-	if errWrite == nil {
-		t.Fatal("expected callback write to fail after cancel")
-	}
-	if !errors.Is(errWrite, errOAuthSessionNotPending) {
-		t.Fatalf("callback write error = %v, want %v", errWrite, errOAuthSessionNotPending)
+	if errSubmit := store.SubmitCallback(OAuthCallback{State: "callback-state", Code: "code"}); !errors.Is(errSubmit, errOAuthSessionNotPending) {
+		t.Fatalf("callback submission error = %v, want %v", errSubmit, errOAuthSessionNotPending)
 	}
 }
 
@@ -234,14 +232,14 @@ func TestGuardOAuthSessionPendingForSave(t *testing.T) {
 		state := provider + "-save-guard"
 		store.Register(state, provider)
 
-		if errGuard := guardOAuthSessionPendingForSave(state, provider); errGuard != nil {
+		if errGuard := guardOAuthSessionPendingForSave(store, state, provider); errGuard != nil {
 			t.Fatalf("%s pending guard error = %v, want nil", provider, errGuard)
 		}
 
 		if !CancelOAuthSession(state) {
 			t.Fatalf("%s CancelOAuthSession() = false, want true", provider)
 		}
-		if errGuard := guardOAuthSessionPendingForSave(state, provider); !errors.Is(errGuard, errOAuthSessionNotPending) {
+		if errGuard := guardOAuthSessionPendingForSave(store, state, provider); !errors.Is(errGuard, errOAuthSessionNotPending) {
 			t.Fatalf("%s after cancel guard error = %v, want %v", provider, errGuard, errOAuthSessionNotPending)
 		}
 	}
@@ -249,13 +247,13 @@ func TestGuardOAuthSessionPendingForSave(t *testing.T) {
 	// Completed and errored sessions must also refuse save.
 	store.Register("completed-save", "codex")
 	store.Complete("completed-save")
-	if errGuard := guardOAuthSessionPendingForSave("completed-save", "codex"); !errors.Is(errGuard, errOAuthSessionNotPending) {
+	if errGuard := guardOAuthSessionPendingForSave(store, "completed-save", "codex"); !errors.Is(errGuard, errOAuthSessionNotPending) {
 		t.Fatalf("completed guard error = %v, want %v", errGuard, errOAuthSessionNotPending)
 	}
 
 	store.Register("error-save", "anthropic")
 	store.SetError("error-save", "Authentication failed")
-	if errGuard := guardOAuthSessionPendingForSave("error-save", "anthropic"); !errors.Is(errGuard, errOAuthSessionNotPending) {
+	if errGuard := guardOAuthSessionPendingForSave(store, "error-save", "anthropic"); !errors.Is(errGuard, errOAuthSessionNotPending) {
 		t.Fatalf("error guard error = %v, want %v", errGuard, errOAuthSessionNotPending)
 	}
 }
@@ -334,11 +332,336 @@ func performOAuthCancelRequest(t *testing.T, router http.Handler, state string) 
 	}
 }
 
+func TestSubmitOAuthCallbackDeliversToBuiltInSession(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	replaceOAuthSessionStoreForTest(t, store)
+	store.Register("callback-state", "codex")
+
+	handler := &Handler{}
+	callback := OAuthCallback{State: "callback-state", Code: "test-code"}
+	if errSubmit := handler.SubmitOAuthCallback(callback); errSubmit != nil {
+		t.Fatalf("SubmitOAuthCallback() error = %v", errSubmit)
+	}
+
+	delivered, errAwait := store.AwaitCallback(context.Background(), "callback-state")
+	if errAwait != nil {
+		t.Fatalf("AwaitCallback() error = %v", errAwait)
+	}
+	if delivered != callback {
+		t.Fatalf("AwaitCallback() = %#v, want %#v", delivered, callback)
+	}
+}
+
+func TestSubmitOAuthCallbackRejectsEmptyAndUnknownState(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+
+	if errSubmit := store.SubmitCallback(OAuthCallback{}); !errors.Is(errSubmit, errInvalidOAuthState) {
+		t.Fatalf("empty SubmitCallback() error = %v, want invalid state", errSubmit)
+	}
+	if errSubmit := store.SubmitCallback(OAuthCallback{State: "unknown-state"}); !errors.Is(errSubmit, errOAuthSessionNotPending) {
+		t.Fatalf("unknown SubmitCallback() error = %v, want not pending", errSubmit)
+	}
+}
+
+func TestSubmitOAuthCallbackRejectsNonPendingSessions(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+
+	store.Register("cancelled-state", "codex")
+	if !store.Cancel("cancelled-state") {
+		t.Fatal("Cancel() = false, want true")
+	}
+	if errSubmit := store.SubmitCallback(OAuthCallback{State: "cancelled-state"}); !errors.Is(errSubmit, errOAuthSessionNotPending) {
+		t.Fatalf("cancelled SubmitCallback() error = %v, want not pending", errSubmit)
+	}
+
+	store.Register("completed-state", "codex")
+	store.Complete("completed-state")
+	if errSubmit := store.SubmitCallback(OAuthCallback{State: "completed-state"}); !errors.Is(errSubmit, errOAuthSessionNotPending) {
+		t.Fatalf("completed SubmitCallback() error = %v, want not pending", errSubmit)
+	}
+
+	store.Register("expired-state", "codex")
+	store.mu.Lock()
+	expired := store.sessions["expired-state"]
+	expired.ExpiresAt = time.Now().Add(-time.Second)
+	store.sessions["expired-state"] = expired
+	store.mu.Unlock()
+	if errSubmit := store.SubmitCallback(OAuthCallback{State: "expired-state"}); !errors.Is(errSubmit, errOAuthSessionNotPending) {
+		t.Fatalf("expired SubmitCallback() error = %v, want not pending", errSubmit)
+	}
+}
+
+func TestSubmitOAuthCallbackAllowsExactlyOneConcurrentDelivery(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	store.Register("callback-state", "codex")
+
+	const submitters = 16
+	var wg sync.WaitGroup
+	results := make(chan error, submitters)
+	for i := 0; i < submitters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- store.SubmitCallback(OAuthCallback{State: "callback-state", Code: "test-code"})
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	for errSubmit := range results {
+		if errSubmit == nil {
+			successes++
+			continue
+		}
+		if !errors.Is(errSubmit, errOAuthCallbackAlreadySubmitted) {
+			t.Fatalf("concurrent SubmitCallback() error = %v, want duplicate callback", errSubmit)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful concurrent submissions = %d, want 1", successes)
+	}
+
+	if _, errAwait := store.AwaitCallback(context.Background(), "callback-state"); errAwait != nil {
+		t.Fatalf("AwaitCallback() error = %v", errAwait)
+	}
+}
+
+func TestSubmitOAuthCallbackRejectsPluginSession(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	if errRegister := store.RegisterPlugin("plugin-state", "gemini-cli", nil); errRegister != nil {
+		t.Fatalf("RegisterPlugin() error = %v", errRegister)
+	}
+
+	if errSubmit := store.SubmitCallback(OAuthCallback{State: "plugin-state", Code: "test-code"}); !errors.Is(errSubmit, errOAuthCallbackNotBuiltinSession) {
+		t.Fatalf("plugin SubmitCallback() error = %v, want built-in session error", errSubmit)
+	}
+}
+
+func TestAwaitOAuthCallbackReturnsQueuedCallbackWhenContextIsReady(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	callback := OAuthCallback{State: "callback-state", Code: "test-code"}
+	store.Register(callback.State, "codex")
+	if errSubmit := store.SubmitCallback(callback); errSubmit != nil {
+		t.Fatalf("SubmitCallback() error = %v", errSubmit)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	delivered, errAwait := store.AwaitCallback(ctx, callback.State)
+	if errAwait != nil || delivered != callback {
+		t.Fatalf("AwaitCallback() = %#v, %v; want %#v, nil", delivered, errAwait, callback)
+	}
+}
+
+func TestAwaitOAuthCallbackDoesNotReturnQueuedCallbackAfterCancel(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	callback := OAuthCallback{State: "callback-state", Code: "test-code"}
+	store.Register(callback.State, "codex")
+	if errSubmit := store.SubmitCallback(callback); errSubmit != nil {
+		t.Fatalf("SubmitCallback() error = %v", errSubmit)
+	}
+	if !store.Cancel(callback.State) {
+		t.Fatal("Cancel() = false, want true")
+	}
+
+	delivered, errAwait := store.AwaitCallback(context.Background(), callback.State)
+	if !errors.Is(errAwait, errOAuthSessionNotPending) {
+		t.Fatalf("AwaitCallback() error = %v, want not pending", errAwait)
+	}
+	if delivered != (OAuthCallback{}) {
+		t.Fatalf("AwaitCallback() = %#v, want no callback after cancellation", delivered)
+	}
+}
+
+func TestAwaitOAuthCallbackRespectsContextCancellation(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	store.Register("callback-state", "codex")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, errAwait := store.AwaitCallback(ctx, "callback-state")
+		result <- errAwait
+	}()
+	cancel()
+
+	if errAwait := <-result; !errors.Is(errAwait, context.Canceled) {
+		t.Fatalf("AwaitCallback() error = %v, want context canceled", errAwait)
+	}
+}
+
+func TestSubmitOAuthCallbackNilHandler(t *testing.T) {
+	var handler *Handler
+	if errSubmit := handler.SubmitOAuthCallback(OAuthCallback{State: "callback-state"}); !errors.Is(errSubmit, errOAuthCallbackHandlerNil) {
+		t.Fatalf("nil SubmitOAuthCallback() error = %v, want handler not initialized", errSubmit)
+	}
+}
+
+func TestAwaitOAuthCallbackReturnsWhenSessionTerminates(t *testing.T) {
+	tests := []struct {
+		name      string
+		terminate func(*oauthSessionStore)
+	}{
+		{"cancel", func(store *oauthSessionStore) { store.Cancel("callback-state") }},
+		{"set error", func(store *oauthSessionStore) { store.SetError("callback-state", "failed") }},
+		{"complete", func(store *oauthSessionStore) { store.Complete("callback-state") }},
+		{"complete provider", func(store *oauthSessionStore) { store.CompleteProvider("codex", oauthSessionSourceBuiltin) }},
+		{"expiry purge", func(store *oauthSessionStore) {
+			store.mu.Lock()
+			session := store.sessions["callback-state"]
+			session.ExpiresAt = time.Now().Add(-time.Second)
+			store.sessions["callback-state"] = session
+			store.mu.Unlock()
+			store.Get("trigger-purge")
+		}},
+		{"replacement", func(store *oauthSessionStore) { store.Register("callback-state", "codex") }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newOAuthSessionStore(time.Minute)
+			store.Register("callback-state", "codex")
+			result := awaitOAuthCallback(t, store, "callback-state")
+			waitForOAuthCallbackWaiter(t, store, "callback-state")
+
+			test.terminate(store)
+			if errAwait := <-result; !errors.Is(errAwait, errOAuthSessionNotPending) {
+				t.Fatalf("AwaitCallback() error = %v, want not pending", errAwait)
+			}
+		})
+	}
+}
+
+func TestRegisterOAuthSessionPreservesPluginSession(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	if errRegister := store.RegisterPlugin("shared-state", "plugin-provider", map[string]any{"source": "plugin"}); errRegister != nil {
+		t.Fatalf("RegisterPlugin() error = %v", errRegister)
+	}
+
+	store.Register("shared-state", "codex")
+	session, ok := store.Get("shared-state")
+	if !ok || session.Source != oauthSessionSourcePlugin || session.Provider != "plugin-provider" {
+		t.Fatalf("Register() replaced plugin session = %#v, present=%t", session, ok)
+	}
+}
+
+func TestAwaitOAuthCallbackRejectsSecondWaiter(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	store.Register("callback-state", "codex")
+	result := awaitOAuthCallback(t, store, "callback-state")
+	waitForOAuthCallbackWaiter(t, store, "callback-state")
+
+	if _, errAwait := store.AwaitCallback(context.Background(), "callback-state"); !errors.Is(errAwait, errOAuthCallbackAlreadyAwaited) {
+		t.Fatalf("second AwaitCallback() error = %v, want already awaited", errAwait)
+	}
+	store.Cancel("callback-state")
+	if errAwait := <-result; !errors.Is(errAwait, errOAuthSessionNotPending) {
+		t.Fatalf("first AwaitCallback() error = %v, want not pending", errAwait)
+	}
+}
+
+func TestAwaitOAuthCallbackConsumesDeliveredCallbackOnce(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	store.Register("callback-state", "codex")
+	callback := OAuthCallback{State: "callback-state", Code: "test-code"}
+	if errSubmit := store.SubmitCallback(callback); errSubmit != nil {
+		t.Fatalf("SubmitCallback() error = %v", errSubmit)
+	}
+
+	delivered, errAwait := store.AwaitCallback(context.Background(), "callback-state")
+	if errAwait != nil || delivered != callback {
+		t.Fatalf("first AwaitCallback() = %#v, %v; want %#v, nil", delivered, errAwait, callback)
+	}
+	if _, errAwait := store.AwaitCallback(context.Background(), "callback-state"); !errors.Is(errAwait, errOAuthSessionNotPending) {
+		t.Fatalf("second AwaitCallback() error = %v, want not pending", errAwait)
+	}
+}
+
+func TestSubmitOAuthCallbackRacesWithTerminalTransitions(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		store := newOAuthSessionStore(time.Minute)
+		store.Register("callback-state", "codex")
+		result := awaitOAuthCallback(t, store, "callback-state")
+		waitForOAuthCallbackWaiter(t, store, "callback-state")
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = store.SubmitCallback(OAuthCallback{State: "callback-state", Code: "test-code"})
+		}()
+		go func() {
+			defer wg.Done()
+			store.Cancel("callback-state")
+		}()
+		wg.Wait()
+
+		if errAwait := <-result; errAwait != nil && !errors.Is(errAwait, errOAuthSessionNotPending) {
+			t.Fatalf("AwaitCallback() error = %v, want callback or not pending", errAwait)
+		}
+	}
+}
+
+func TestOAuthSessionStoreSwapDoesNotCrossDeliverCapturedFlow(t *testing.T) {
+	first := newOAuthSessionStore(time.Minute)
+	replaceOAuthSessionStoreForTest(t, first)
+	flowStore := registerOAuthSessionForFlow("shared-state", "codex")
+	result := awaitOAuthCallback(t, flowStore, "shared-state")
+	waitForOAuthCallbackWaiter(t, flowStore, "shared-state")
+
+	second := newOAuthSessionStore(time.Minute)
+	swapOAuthSessionStore(second)
+	second.Register("shared-state", "codex")
+	handler := &Handler{}
+	if errSubmit := handler.SubmitOAuthCallback(OAuthCallback{State: "shared-state", Code: "second-code"}); errSubmit != nil {
+		t.Fatalf("SubmitOAuthCallback() into replacement store error = %v", errSubmit)
+	}
+
+	select {
+	case errAwait := <-result:
+		t.Fatalf("captured waiter completed from replacement store: %v", errAwait)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	if errSubmit := flowStore.SubmitCallback(OAuthCallback{State: "shared-state", Code: "first-code"}); errSubmit != nil {
+		t.Fatalf("SubmitCallback() into captured store error = %v", errSubmit)
+	}
+	if errAwait := <-result; errAwait != nil {
+		t.Fatalf("captured AwaitCallback() error = %v", errAwait)
+	}
+}
+
+func awaitOAuthCallback(t *testing.T, store *oauthSessionStore, state string) <-chan error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() {
+		_, errAwait := store.AwaitCallback(context.Background(), state)
+		result <- errAwait
+	}()
+	return result
+}
+
+func waitForOAuthCallbackWaiter(t *testing.T, store *oauthSessionStore, state string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.RLock()
+		waiting := store.sessions[state].callbackAwaiting
+		store.mu.RUnlock()
+		if waiting {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("AwaitCallback(%q) did not start waiting", state)
+}
+
 func replaceOAuthSessionStoreForTest(t *testing.T, store *oauthSessionStore) {
 	t.Helper()
-	original := oauthSessions
-	oauthSessions = store
+	original := swapOAuthSessionStore(store)
 	t.Cleanup(func() {
-		oauthSessions = original
+		swapOAuthSessionStore(original)
 	})
 }

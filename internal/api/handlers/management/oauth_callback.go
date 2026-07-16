@@ -119,8 +119,23 @@ func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) 
 		return
 	}
 
-	if _, errWrite := WriteOAuthCallbackFileForPendingSession(h.cfg.AuthDir, canonicalProvider, state, code, errMsg); errWrite != nil {
-		if errors.Is(errWrite, errOAuthSessionNotPending) {
+	if isPlugin {
+		if _, errWrite := writePluginOAuthCallbackFile(h.cfg.AuthDir, canonicalProvider, state, code, errMsg); errWrite != nil {
+			if errors.Is(errWrite, errOAuthSessionNotPending) {
+				_, status, okSession := GetOAuthSession(state)
+				if okSession && status != "" {
+					c.JSON(http.StatusConflict, gin.H{"status": "error", "error": status})
+					return
+				}
+				c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "oauth flow is not pending"})
+				return
+			}
+			log.WithError(errWrite).Error("failed to persist oauth callback")
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to persist oauth callback"})
+			return
+		}
+	} else if errSubmit := h.SubmitOAuthCallback(OAuthCallback{State: state, Code: code, Error: errMsg}); errSubmit != nil {
+		if errors.Is(errSubmit, errOAuthSessionNotPending) || errors.Is(errSubmit, errOAuthCallbackAlreadySubmitted) {
 			_, status, okSession := GetOAuthSession(state)
 			if okSession && status != "" {
 				c.JSON(http.StatusConflict, gin.H{"status": "error", "error": status})
@@ -129,8 +144,8 @@ func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) 
 			c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "oauth flow is not pending"})
 			return
 		}
-		log.WithError(errWrite).Error("failed to persist oauth callback")
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to persist oauth callback"})
+		log.WithError(errSubmit).Error("failed to submit oauth callback")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to submit oauth callback"})
 		return
 	}
 

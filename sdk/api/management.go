@@ -17,6 +17,9 @@ import (
 // Handler re-exports the management handler used by the internal HTTP API.
 type Handler = internalmanagement.Handler
 
+// OAuthCallback re-exports a callback payload for a pending built-in OAuth session.
+type OAuthCallback = internalmanagement.OAuthCallback
+
 // ManagementTokenRequester exposes a limited subset of management endpoints for requesting tokens.
 type ManagementTokenRequester interface {
 	RequestAnthropicToken(*gin.Context)
@@ -25,6 +28,7 @@ type ManagementTokenRequester interface {
 	RequestKimiToken(*gin.Context)
 	GetAuthStatus(c *gin.Context)
 	PostOAuthCallback(c *gin.Context)
+	SubmitOAuthCallback(OAuthCallback) error
 }
 
 type managementTokenRequester struct {
@@ -72,6 +76,10 @@ func (m *managementTokenRequester) PostOAuthCallback(c *gin.Context) {
 	m.handler.PostOAuthCallback(c)
 }
 
+func (m *managementTokenRequester) SubmitOAuthCallback(callback OAuthCallback) error {
+	return m.handler.SubmitOAuthCallback(callback)
+}
+
 // WriteConfig persists management configuration to disk.
 func WriteConfig(path string, data []byte) error {
 	return internalmanagement.WriteConfig(path, data)
@@ -115,16 +123,6 @@ func ValidateOAuthState(state string) error {
 // NormalizeOAuthProvider normalizes a provider name to its canonical form.
 func NormalizeOAuthProvider(provider string) (string, error) {
 	return internalmanagement.NormalizeOAuthProvider(provider)
-}
-
-// WriteOAuthCallbackFile writes an OAuth callback payload to disk.
-func WriteOAuthCallbackFile(authDir, provider, state, code, errorMessage string) (string, error) {
-	return internalmanagement.WriteOAuthCallbackFile(authDir, provider, state, code, errorMessage)
-}
-
-// WriteOAuthCallbackFileForPendingSession writes an OAuth callback payload for a pending session.
-func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, errorMessage string) (string, error) {
-	return internalmanagement.WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, errorMessage)
 }
 
 // PopulateAuthContext copies auth metadata from a Gin context into a request context.

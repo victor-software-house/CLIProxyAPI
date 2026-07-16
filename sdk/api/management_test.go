@@ -13,3 +13,14 @@ func TestNewHandlerWithoutConfigFilePathAcceptsCallerHTTPClient(t *testing.T) {
 		t.Fatal("NewHandlerWithoutConfigFilePath() returned nil")
 	}
 }
+
+func TestManagementTokenRequesterSubmitsOAuthCallback(t *testing.T) {
+	state := "sdk-oauth-callback-state"
+	RegisterOAuthSession(state, "codex")
+	defer CompleteOAuthSession(state)
+
+	requester := NewManagementTokenRequester(&config.Config{AuthDir: t.TempDir()}, nil)
+	if errSubmit := requester.SubmitOAuthCallback(OAuthCallback{State: state, Code: "test-code"}); errSubmit != nil {
+		t.Fatalf("SubmitOAuthCallback() error = %v", errSubmit)
+	}
+}

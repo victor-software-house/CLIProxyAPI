@@ -65,6 +65,13 @@ type codexOAuthService interface {
 	CreateTokenStorage(bundle *codex.CodexAuthBundle) *codex.CodexTokenStorage
 }
 
+type antigravityOAuthService interface {
+	BuildAuthURL(state, redirectURI string) string
+	ExchangeCodeForTokens(ctx context.Context, code, redirectURI string) (*antigravity.TokenResponse, error)
+	FetchUserInfo(ctx context.Context, accessToken string) (string, error)
+	FetchProjectID(ctx context.Context, accessToken string) (string, error)
+}
+
 type xaiOAuthService interface {
 	StartDeviceFlow(ctx context.Context) (*xaiauth.DeviceCodeResponse, error)
 	WaitForAuthorization(ctx context.Context, deviceCode *xaiauth.DeviceCodeResponse) (*xaiauth.AuthBundle, error)
@@ -83,6 +90,9 @@ var (
 	newCodexOAuthService = func(cfg *config.Config, httpClient *http.Client) codexOAuthService {
 		return codex.NewCodexAuthWithHTTPClient(cfg, httpClient)
 	}
+	newAntigravityOAuthService = func(cfg *config.Config, _ *http.Client) antigravityOAuthService {
+		return antigravity.NewAntigravityAuth(cfg, nil)
+	}
 	newXAIOAuthService = func(cfg *config.Config, httpClient *http.Client) xaiOAuthService {
 		return xaiauth.NewXAIAuthWithHTTPClient(cfg, httpClient)
 	}
@@ -94,6 +104,10 @@ func (h *Handler) newClaudeOAuthService() claudeOAuthService {
 
 func (h *Handler) newCodexOAuthService() codexOAuthService {
 	return newCodexOAuthService(h.cfg, h.oauthHTTPClient)
+}
+
+func (h *Handler) newAntigravityOAuthService() antigravityOAuthService {
+	return newAntigravityOAuthService(h.cfg, nil)
 }
 
 func (h *Handler) newXAIOAuthService() xaiOAuthService {
@@ -1980,7 +1994,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
-	RegisterOAuthSession(state, "anthropic")
+	oauthStore := registerOAuthSessionForFlow(state, "anthropic")
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -2004,49 +2018,34 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			defer stopCallbackForwarderInstance(anthropicCallbackPort, forwarder)
 		}
 
-		// Helper: wait for callback file
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
-		waitForFile := func(path string, timeout time.Duration) (oauthCallbackFilePayload, error) {
-			deadline := time.Now().Add(timeout)
-			for {
-				if !IsOAuthSessionPending(state, "anthropic") {
-					return oauthCallbackFilePayload{}, errOAuthSessionNotPending
-				}
-				if time.Now().After(deadline) {
-					SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
-					return oauthCallbackFilePayload{}, fmt.Errorf("timeout waiting for OAuth callback")
-				}
-				payload, ready, errConsume := consumeOAuthCallbackFile(path)
-				if errConsume != nil {
-					log.WithError(errConsume).Debug("failed to consume OAuth callback file")
-				} else if ready {
-					return payload, nil
-				}
-				time.Sleep(500 * time.Millisecond)
-			}
-		}
-
 		fmt.Println("Waiting for authentication callback...")
-		// Wait up to 5 minutes
-		payload, errWait := waitForFile(waitFile, 5*time.Minute)
+		callbackCtx, cancelCallback := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancelCallback()
+		payload, errWait := oauthStore.AwaitCallback(callbackCtx, state)
 		if errWait != nil {
 			if errors.Is(errWait, errOAuthSessionNotPending) {
 				return
+			}
+			if errors.Is(errWait, context.DeadlineExceeded) {
+				oauthStore.SetError(state, "Timeout waiting for OAuth callback")
 			}
 			authErr := claude.NewAuthenticationError(claude.ErrCallbackTimeout, errWait)
 			log.Error(claude.GetUserFriendlyMessage(authErr))
 			return
 		}
+		if errGuard := guardOAuthSessionPendingForSave(oauthStore, state, "anthropic"); errGuard != nil {
+			return
+		}
 		if errStr := payload.Error; errStr != "" {
 			oauthErr := claude.NewOAuthError(errStr, "", http.StatusBadRequest)
 			log.Error(claude.GetUserFriendlyMessage(oauthErr))
-			SetOAuthSessionError(state, "Bad request")
+			oauthStore.SetError(state, "Bad request")
 			return
 		}
 		if payload.State != state {
 			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, payload.State))
 			log.Error(claude.GetUserFriendlyMessage(authErr))
-			SetOAuthSessionError(state, "State code error")
+			oauthStore.SetError(state, "State code error")
 			return
 		}
 
@@ -2059,7 +2058,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			oauthStore.SetError(state, "Failed to exchange authorization code for tokens")
 			return
 		}
 
@@ -2072,13 +2071,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: map[string]any{"email": tokenStorage.Email},
 		}
-		if errGuard := guardOAuthSessionPendingForSave(state, "anthropic"); errGuard != nil {
+		if errGuard := guardOAuthSessionPendingForSave(oauthStore, state, "anthropic"); errGuard != nil {
 			return
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			oauthStore.SetError(state, "Failed to save authentication tokens")
 			return
 		}
 
@@ -2087,7 +2086,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Claude services through this CLI")
-		CompleteOAuthSession(state)
+		oauthStore.Complete(state)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2126,7 +2125,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
-	RegisterOAuthSession(state, "codex")
+	oauthStore := registerOAuthSessionForFlow(state, "codex")
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -2150,48 +2149,43 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			defer stopCallbackForwarderInstance(codexCallbackPort, forwarder)
 		}
 
-		// Wait for callback file
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
-		deadline := time.Now().Add(5 * time.Minute)
-		var code string
-		for {
-			if !IsOAuthSessionPending(state, "codex") {
+		callbackCtx, cancelCallback := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancelCallback()
+		payload, errWait := oauthStore.AwaitCallback(callbackCtx, state)
+		if errWait != nil {
+			if errors.Is(errWait, errOAuthSessionNotPending) {
 				return
 			}
-			if time.Now().After(deadline) {
-				authErr := codex.NewAuthenticationError(codex.ErrCallbackTimeout, fmt.Errorf("timeout waiting for OAuth callback"))
-				log.Error(codex.GetUserFriendlyMessage(authErr))
-				SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
-				return
+			if errors.Is(errWait, context.DeadlineExceeded) {
+				oauthStore.SetError(state, "Timeout waiting for OAuth callback")
 			}
-			payload, ready, errConsume := consumeOAuthCallbackFile(waitFile)
-			if errConsume != nil {
-				log.WithError(errConsume).Debug("failed to consume OAuth callback file")
-			} else if ready {
-				if errStr := payload.Error; errStr != "" {
-					oauthErr := codex.NewOAuthError(errStr, "", http.StatusBadRequest)
-					log.Error(codex.GetUserFriendlyMessage(oauthErr))
-					SetOAuthSessionError(state, "Bad Request")
-					return
-				}
-				if payload.State != state {
-					authErr := codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, payload.State))
-					SetOAuthSessionError(state, "State code error")
-					log.Error(codex.GetUserFriendlyMessage(authErr))
-					return
-				}
-				code = payload.Code
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
+			authErr := codex.NewAuthenticationError(codex.ErrCallbackTimeout, errWait)
+			log.Error(codex.GetUserFriendlyMessage(authErr))
+			return
 		}
+		if errGuard := guardOAuthSessionPendingForSave(oauthStore, state, "codex"); errGuard != nil {
+			return
+		}
+		if errStr := payload.Error; errStr != "" {
+			oauthErr := codex.NewOAuthError(errStr, "", http.StatusBadRequest)
+			log.Error(codex.GetUserFriendlyMessage(oauthErr))
+			oauthStore.SetError(state, "Bad Request")
+			return
+		}
+		if payload.State != state {
+			authErr := codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, payload.State))
+			oauthStore.SetError(state, "State code error")
+			log.Error(codex.GetUserFriendlyMessage(authErr))
+			return
+		}
+		code := payload.Code
 
 		log.Debug("Authorization code received, exchanging for tokens...")
 		// Exchange code for tokens using internal auth service
 		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
+			oauthStore.SetError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
 			return
 		}
@@ -2221,12 +2215,12 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
-		if errGuard := guardOAuthSessionPendingForSave(state, "codex"); errGuard != nil {
+		if errGuard := guardOAuthSessionPendingForSave(oauthStore, state, "codex"); errGuard != nil {
 			return
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			oauthStore.SetError(state, "Failed to save authentication tokens")
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			return
 		}
@@ -2235,7 +2229,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Codex services through this CLI")
-		CompleteOAuthSession(state)
+		oauthStore.Complete(state)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2247,7 +2241,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 	fmt.Println("Initializing Antigravity authentication...")
 
-	authSvc := antigravity.NewAntigravityAuth(h.cfg, nil)
+	authSvc := h.newAntigravityOAuthService()
 
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
@@ -2259,7 +2253,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	redirectURI := fmt.Sprintf("http://localhost:%d/oauth-callback", antigravity.CallbackPort)
 	authURL := authSvc.BuildAuthURL(state, redirectURI)
 
-	RegisterOAuthSession(state, "antigravity")
+	oauthStore := registerOAuthSessionForFlow(state, "antigravity")
 
 	isWebUI := isWebUIRequest(c)
 	var forwarder *callbackForwarder
@@ -2283,67 +2277,62 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			defer stopCallbackForwarderInstance(antigravity.CallbackPort, forwarder)
 		}
 
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
-		deadline := time.Now().Add(5 * time.Minute)
-		var authCode string
-		for {
-			if !IsOAuthSessionPending(state, "antigravity") {
+		callbackCtx, cancelCallback := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancelCallback()
+		payload, errWait := oauthStore.AwaitCallback(callbackCtx, state)
+		if errWait != nil {
+			if errors.Is(errWait, errOAuthSessionNotPending) {
 				return
 			}
-			if time.Now().After(deadline) {
+			if errors.Is(errWait, context.DeadlineExceeded) {
 				log.Error("oauth flow timed out")
-				SetOAuthSessionError(state, "OAuth flow timed out")
-				return
+				oauthStore.SetError(state, "OAuth flow timed out")
 			}
-			payload, ready, errConsume := consumeOAuthCallbackFile(waitFile)
-			if errConsume != nil {
-				log.WithError(errConsume).Debug("failed to consume OAuth callback file")
-			} else if ready {
-				if errStr := strings.TrimSpace(payload.Error); errStr != "" {
-					log.Errorf("Authentication failed: %s", errStr)
-					SetOAuthSessionError(state, "Authentication failed")
-					return
-				}
-				if payloadState := strings.TrimSpace(payload.State); payloadState != "" && payloadState != state {
-					log.Errorf("Authentication failed: state mismatch")
-					SetOAuthSessionError(state, "Authentication failed: state mismatch")
-					return
-				}
-				authCode = strings.TrimSpace(payload.Code)
-				if authCode == "" {
-					log.Error("Authentication failed: code not found")
-					SetOAuthSessionError(state, "Authentication failed: code not found")
-					return
-				}
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
+			return
 		}
-
+		if errGuard := guardOAuthSessionPendingForSave(oauthStore, state, "antigravity"); errGuard != nil {
+			return
+		}
+		if errStr := strings.TrimSpace(payload.Error); errStr != "" {
+			log.Errorf("Authentication failed: %s", errStr)
+			oauthStore.SetError(state, "Authentication failed")
+			return
+		}
+		if payloadState := strings.TrimSpace(payload.State); payloadState != "" && payloadState != state {
+			log.Errorf("Authentication failed: state mismatch")
+			oauthStore.SetError(state, "Authentication failed: state mismatch")
+			return
+		}
+		authCode := strings.TrimSpace(payload.Code)
+		if authCode == "" {
+			log.Error("Authentication failed: code not found")
+			oauthStore.SetError(state, "Authentication failed: code not found")
+			return
+		}
 		tokenResp, errToken := authSvc.ExchangeCodeForTokens(ctx, authCode, redirectURI)
 		if errToken != nil {
 			log.Errorf("Failed to exchange token: %v", errToken)
-			SetOAuthSessionError(state, "Failed to exchange token")
+			oauthStore.SetError(state, "Failed to exchange token")
 			return
 		}
 
 		accessToken := strings.TrimSpace(tokenResp.AccessToken)
 		if accessToken == "" {
 			log.Error("antigravity: token exchange returned empty access token")
-			SetOAuthSessionError(state, "Failed to exchange token")
+			oauthStore.SetError(state, "Failed to exchange token")
 			return
 		}
 
 		email, errInfo := authSvc.FetchUserInfo(ctx, accessToken)
 		if errInfo != nil {
 			log.Errorf("Failed to fetch user info: %v", errInfo)
-			SetOAuthSessionError(state, "Failed to fetch user info")
+			oauthStore.SetError(state, "Failed to fetch user info")
 			return
 		}
 		email = strings.TrimSpace(email)
 		if email == "" {
 			log.Error("antigravity: user info returned empty email")
-			SetOAuthSessionError(state, "Failed to fetch user info")
+			oauthStore.SetError(state, "Failed to fetch user info")
 			return
 		}
 
@@ -2387,17 +2376,17 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			Label:    label,
 			Metadata: metadata,
 		}
-		if errGuard := guardOAuthSessionPendingForSave(state, "antigravity"); errGuard != nil {
+		if errGuard := guardOAuthSessionPendingForSave(oauthStore, state, "antigravity"); errGuard != nil {
 			return
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save token to file: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to file")
+			oauthStore.SetError(state, "Failed to save token to file")
 			return
 		}
 
-		CompleteOAuthSession(state)
+		oauthStore.Complete(state)
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
 			fmt.Printf("Using GCP project: %s\n", util.HideAPIKey(projectID))
@@ -2428,31 +2417,31 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 		authURL = strings.TrimSpace(deviceFlow.VerificationURI)
 	}
 
-	RegisterOAuthSession(state, "xai")
+	oauthStore := registerOAuthSessionForFlow(state, "xai")
 
 	go func() {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
-		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "xai")
+		go watchOAuthSessionCancel(oauthStore, pollCtx, cancelPoll, state, "xai")
 
 		fmt.Println("Waiting for xAI authentication...")
 		bundle, errWaitForAuthorization := authSvc.WaitForAuthorization(pollCtx, deviceFlow)
 		if errWaitForAuthorization != nil {
-			if !IsOAuthSessionPending(state, "xai") {
+			if !oauthStore.IsPending(state, "xai") {
 				return
 			}
 			log.Errorf("xAI authentication failed: %v", errWaitForAuthorization)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
+			oauthStore.SetError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
 			return
 		}
-		if !IsOAuthSessionPending(state, "xai") {
+		if !oauthStore.IsPending(state, "xai") {
 			return
 		}
 
 		tokenStorage := authSvc.CreateTokenStorage(bundle)
 		if tokenStorage == nil || strings.TrimSpace(tokenStorage.AccessToken) == "" {
 			log.Error("xAI token exchange returned empty access token")
-			SetOAuthSessionError(state, "Failed to exchange token")
+			oauthStore.SetError(state, "Failed to exchange token")
 			return
 		}
 
@@ -2494,17 +2483,17 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 				"base_url":  tokenStorage.BaseURL,
 			},
 		}
-		if errGuard := guardOAuthSessionPendingForSave(state, "xai"); errGuard != nil {
+		if errGuard := guardOAuthSessionPendingForSave(oauthStore, state, "xai"); errGuard != nil {
 			return
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save xAI token to file: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to file")
+			oauthStore.SetError(state, "Failed to save token to file")
 			return
 		}
 
-		CompleteOAuthSession(state)
+		oauthStore.Complete(state)
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use xAI services through this CLI")
 	}()
@@ -2543,24 +2532,24 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		authURL = deviceFlow.VerificationURI
 	}
 
-	RegisterOAuthSession(state, "kimi")
+	oauthStore := registerOAuthSessionForFlow(state, "kimi")
 
 	go func() {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
-		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "kimi")
+		go watchOAuthSessionCancel(oauthStore, pollCtx, cancelPoll, state, "kimi")
 
 		fmt.Println("Waiting for authentication...")
 		authBundle, errWaitForAuthorization := kimiAuth.WaitForAuthorization(pollCtx, deviceFlow)
 		if errWaitForAuthorization != nil {
-			if !IsOAuthSessionPending(state, "kimi") {
+			if !oauthStore.IsPending(state, "kimi") {
 				return
 			}
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
+			oauthStore.SetError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
 			fmt.Printf("Authentication failed: %v\n", errWaitForAuthorization)
 			return
 		}
-		if !IsOAuthSessionPending(state, "kimi") {
+		if !oauthStore.IsPending(state, "kimi") {
 			return
 		}
 
@@ -2592,19 +2581,19 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: metadata,
 		}
-		if errGuard := guardOAuthSessionPendingForSave(state, "kimi"); errGuard != nil {
+		if errGuard := guardOAuthSessionPendingForSave(oauthStore, state, "kimi"); errGuard != nil {
 			return
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			oauthStore.SetError(state, "Failed to save authentication tokens")
 			return
 		}
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Kimi services through this CLI")
-		CompleteOAuthSession(state)
+		oauthStore.Complete(state)
 	}()
 
 	response := gin.H{"status": "ok", "url": authURL, "state": state, "flow": "device"}
@@ -2618,8 +2607,8 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 }
 
 // watchOAuthSessionCancel cancels pollCtx once the OAuth session is no longer pending.
-func watchOAuthSessionCancel(pollCtx context.Context, cancel context.CancelFunc, state, provider string) {
-	if cancel == nil {
+func watchOAuthSessionCancel(store *oauthSessionStore, pollCtx context.Context, cancel context.CancelFunc, state, provider string) {
+	if store == nil || cancel == nil {
 		return
 	}
 	ticker := time.NewTicker(2 * time.Second)
@@ -2629,7 +2618,7 @@ func watchOAuthSessionCancel(pollCtx context.Context, cancel context.CancelFunc,
 		case <-pollCtx.Done():
 			return
 		case <-ticker.C:
-			if !IsOAuthSessionPending(state, provider) {
+			if !store.IsPending(state, provider) {
 				cancel()
 				return
 			}

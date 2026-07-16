@@ -47,6 +47,7 @@ func (f *fakeCodexOAuthService) CreateTokenStorage(bundle *codex.CodexAuthBundle
 }
 
 func TestRequestCodexTokenCompletionKeepsConcurrentSessionPending(t *testing.T) {
+	replaceOAuthSessionStoreForTest(t, newOAuthSessionStore(time.Minute))
 	originalNewCodexOAuthService := newCodexOAuthService
 	newCodexOAuthService = func(_ *config.Config, _ *http.Client) codexOAuthService {
 		return &fakeCodexOAuthService{}
@@ -65,8 +66,8 @@ func TestRequestCodexTokenCompletionKeepsConcurrentSessionPending(t *testing.T) 
 	defer CompleteOAuthSession(firstState)
 	defer CompleteOAuthSession(secondState)
 
-	if _, errWrite := WriteOAuthCallbackFileForPendingSession(authDir, "codex", firstState, "first-code", ""); errWrite != nil {
-		t.Fatalf("write first callback file: %v", errWrite)
+	if errSubmit := handler.SubmitOAuthCallback(OAuthCallback{State: firstState, Code: "first-code"}); errSubmit != nil {
+		t.Fatalf("submit first callback: %v", errSubmit)
 	}
 
 	waitForOAuthSessionDone(t, firstState)

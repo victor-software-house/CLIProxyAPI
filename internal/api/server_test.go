@@ -387,6 +387,35 @@ func TestOAuthCallbackRouteSkipsManagementKeyMiddleware(t *testing.T) {
 	}
 }
 
+func TestBuiltInOAuthCallbackRoutesDoNotCreateCallbackFiles(t *testing.T) {
+	server := newTestServer(t)
+	for _, test := range []struct {
+		path     string
+		provider string
+	}{
+		{path: "/anthropic/callback", provider: "anthropic"},
+		{path: "/codex/callback", provider: "codex"},
+		{path: "/antigravity/callback", provider: "antigravity"},
+	} {
+		t.Run(test.provider, func(t *testing.T) {
+			state := "server-" + test.provider + "-oauth-state"
+			managementHandlers.RegisterOAuthSession(state, test.provider)
+			defer managementHandlers.CompleteOAuthSession(state)
+
+			req := httptest.NewRequest(http.MethodGet, test.path+"?state="+state+"&code=test-code", nil)
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+			}
+			callbackPath := filepath.Join(server.cfg.AuthDir, ".oauth-"+test.provider+"-"+state+".oauth")
+			if _, errStat := os.Stat(callbackPath); !os.IsNotExist(errStat) {
+				t.Fatalf("built-in callback file should not exist: %v", errStat)
+			}
+		})
+	}
+}
+
 func TestNewServerWithPluginHostInjectsHandlerInterceptors(t *testing.T) {
 	host := pluginhost.New()
 	server := newTestServerWithOptions(t, WithPluginHost(host))

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
@@ -48,6 +49,27 @@ func (s testCodexOAuthService) ExchangeCodeForTokens(context.Context, string, *c
 
 func (testCodexOAuthService) CreateTokenStorage(*codex.CodexAuthBundle) *codex.CodexTokenStorage {
 	return nil
+}
+
+type testAntigravityOAuthService struct {
+	exchangeStarted chan<- struct{}
+}
+
+func (s testAntigravityOAuthService) BuildAuthURL(string, string) string {
+	return "https://auth.example/antigravity"
+}
+
+func (s testAntigravityOAuthService) ExchangeCodeForTokens(context.Context, string, string) (*antigravity.TokenResponse, error) {
+	close(s.exchangeStarted)
+	return nil, errors.New("stop before credential persistence")
+}
+
+func (testAntigravityOAuthService) FetchUserInfo(context.Context, string) (string, error) {
+	return "", errors.New("unexpected user info fetch")
+}
+
+func (testAntigravityOAuthService) FetchProjectID(context.Context, string) (string, error) {
+	return "", errors.New("unexpected project fetch")
 }
 
 type testXAIOAuthService struct{}
@@ -111,6 +133,7 @@ func waitForOAuthCodeExchange(t *testing.T, provider string, exchangeStarted <-c
 }
 
 func TestOAuthStartPathsUseHandlerHTTPClient(t *testing.T) {
+	replaceOAuthSessionStoreForTest(t, newOAuthSessionStore(time.Minute))
 	gin.SetMode(gin.TestMode)
 	authDir := t.TempDir()
 	client := &http.Client{}
@@ -118,16 +141,19 @@ func TestOAuthStartPathsUseHandlerHTTPClient(t *testing.T) {
 
 	previousClaudeService := newClaudeOAuthService
 	previousCodexService := newCodexOAuthService
+	previousAntigravityService := newAntigravityOAuthService
 	previousXAIService := newXAIOAuthService
 	t.Cleanup(func() {
 		newClaudeOAuthService = previousClaudeService
 		newCodexOAuthService = previousCodexService
+		newAntigravityOAuthService = previousAntigravityService
 		newXAIOAuthService = previousXAIService
 	})
 
 	claudeExchangeStarted := make(chan struct{})
 	codexExchangeStarted := make(chan struct{})
-	var claudeClient, codexClient, xaiClient *http.Client
+	antigravityExchangeStarted := make(chan struct{})
+	var claudeClient, codexClient, antigravityClient, xaiClient *http.Client
 	newClaudeOAuthService = func(_ *config.Config, got *http.Client) claudeOAuthService {
 		claudeClient = got
 		return testClaudeOAuthService{exchangeStarted: claudeExchangeStarted}
@@ -136,24 +162,35 @@ func TestOAuthStartPathsUseHandlerHTTPClient(t *testing.T) {
 		codexClient = got
 		return testCodexOAuthService{exchangeStarted: codexExchangeStarted}
 	}
+	newAntigravityOAuthService = func(_ *config.Config, got *http.Client) antigravityOAuthService {
+		antigravityClient = got
+		return testAntigravityOAuthService{exchangeStarted: antigravityExchangeStarted}
+	}
 	newXAIOAuthService = func(_ *config.Config, got *http.Client) xaiOAuthService {
 		xaiClient = got
 		return testXAIOAuthService{}
 	}
 
 	claudeState := requestOAuthStart(t, handler.RequestAnthropicToken)
-	if _, err := WriteOAuthCallbackFileForPendingSession(authDir, "anthropic", claudeState, "test-code", ""); err != nil {
-		t.Fatalf("write Claude callback: %v", err)
+	if errSubmit := handler.SubmitOAuthCallback(OAuthCallback{State: claudeState, Code: "test-code"}); errSubmit != nil {
+		t.Fatalf("submit Claude callback: %v", errSubmit)
 	}
 	waitForOAuthCodeExchange(t, "Claude", claudeExchangeStarted)
 	waitForOAuthSessionCompletion(t, claudeState, "anthropic")
 
 	codexState := requestOAuthStart(t, handler.RequestCodexToken)
-	if _, err := WriteOAuthCallbackFileForPendingSession(authDir, "codex", codexState, "test-code", ""); err != nil {
-		t.Fatalf("write Codex callback: %v", err)
+	if errSubmit := handler.SubmitOAuthCallback(OAuthCallback{State: codexState, Code: "test-code"}); errSubmit != nil {
+		t.Fatalf("submit Codex callback: %v", errSubmit)
 	}
 	waitForOAuthCodeExchange(t, "Codex", codexExchangeStarted)
 	waitForOAuthSessionCompletion(t, codexState, "codex")
+
+	antigravityState := requestOAuthStart(t, handler.RequestAntigravityToken)
+	if errSubmit := handler.SubmitOAuthCallback(OAuthCallback{State: antigravityState, Code: "test-code"}); errSubmit != nil {
+		t.Fatalf("submit Antigravity callback: %v", errSubmit)
+	}
+	waitForOAuthCodeExchange(t, "Antigravity", antigravityExchangeStarted)
+	waitForOAuthSessionCompletion(t, antigravityState, "antigravity")
 
 	xaiRecorder := httptest.NewRecorder()
 	xaiCtx, _ := gin.CreateTestContext(xaiRecorder)
@@ -167,6 +204,34 @@ func TestOAuthStartPathsUseHandlerHTTPClient(t *testing.T) {
 		if got != client {
 			t.Fatalf("OAuth service received client %p, want handler client %p", got, client)
 		}
+	}
+	if antigravityClient != nil {
+		t.Fatalf("Antigravity OAuth service received client %p, want nil", antigravityClient)
+	}
+}
+
+func TestCancelledBuiltInCallbackDoesNotExchangeOrSave(t *testing.T) {
+	replaceOAuthSessionStoreForTest(t, newOAuthSessionStore(time.Minute))
+	previousCodexService := newCodexOAuthService
+	t.Cleanup(func() { newCodexOAuthService = previousCodexService })
+
+	exchangeStarted := make(chan struct{})
+	newCodexOAuthService = func(_ *config.Config, _ *http.Client) codexOAuthService {
+		return testCodexOAuthService{exchangeStarted: exchangeStarted}
+	}
+
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	state := requestOAuthStart(t, handler.RequestCodexToken)
+	if !CancelOAuthSession(state) {
+		t.Fatal("CancelOAuthSession() = false, want true")
+	}
+	if errSubmit := handler.SubmitOAuthCallback(OAuthCallback{State: state, Code: "test-code"}); !errors.Is(errSubmit, errOAuthSessionNotPending) {
+		t.Fatalf("SubmitOAuthCallback() error = %v, want not pending", errSubmit)
+	}
+	select {
+	case <-exchangeStarted:
+		t.Fatal("code exchange started for cancelled OAuth session")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
