@@ -1350,9 +1350,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 			return
 		}
 		h.reloadConfigAfterManagementSave(ctx, cfgSnapshot)
-		if h.tokenStore != nil {
-			_ = h.tokenStore.Delete(ctx, targetAuth.ID)
-		}
+		_ = h.deleteTokenRecord(ctx, targetAuth.ID)
 		c.JSON(http.StatusOK, gin.H{
 			"status":           "ok",
 			"disabled":         *req.Disabled,
@@ -1903,16 +1901,24 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 	if h == nil {
 		return nil
 	}
-	store := h.tokenStore
-	if store == nil {
-		store = sdkAuth.GetTokenStore()
-		h.tokenStore = store
-	}
+	store := h.resolveTokenStore()
 	if h.cfg != nil {
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(h.cfg.AuthDir)
 		}
 	}
+	return store
+}
+
+// resolveTokenStore returns the handler-local store, restoring the lazy default when needed.
+func (h *Handler) resolveTokenStore() coreauth.Store {
+	h.tokenStoreMu.Lock()
+	store := h.tokenStore
+	if store == nil {
+		store = sdkAuth.GetTokenStore()
+		h.tokenStore = store
+	}
+	h.tokenStoreMu.Unlock()
 	return store
 }
 
