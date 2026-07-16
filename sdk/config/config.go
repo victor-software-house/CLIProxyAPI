@@ -4,7 +4,10 @@
 // embed CLIProxyAPI without importing internal packages.
 package config
 
-import internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+import (
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalregistry "github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+)
 
 type SDKConfig = internalconfig.SDKConfig
 
@@ -19,6 +22,14 @@ type PayloadRule = internalconfig.PayloadRule
 type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
 
+type RoutingConfig = internalconfig.RoutingConfig
+type QuotaExceeded = internalconfig.QuotaExceeded
+type ClaudeHeaderDefaults = internalconfig.ClaudeHeaderDefaults
+type CodexHeaderDefaults = internalconfig.CodexHeaderDefaults
+type CodexConfig = internalconfig.CodexConfig
+type CloakConfig = internalconfig.CloakConfig
+type DisableImageGenerationMode = internalconfig.DisableImageGenerationMode
+
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type ClaudeKey = internalconfig.ClaudeKey
@@ -28,10 +39,19 @@ type OpenAICompatibility = internalconfig.OpenAICompatibility
 type OpenAICompatibilityAPIKey = internalconfig.OpenAICompatibilityAPIKey
 type OpenAICompatibilityModel = internalconfig.OpenAICompatibilityModel
 
+type GeminiModel = internalconfig.GeminiModel
+type ClaudeModel = internalconfig.ClaudeModel
+type CodexModel = internalconfig.CodexModel
+type ThinkingSupport = internalregistry.ThinkingSupport
+
 type TLS = internalconfig.TLSConfig
 
 const (
-	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	DefaultPanelGitHubRepository      = internalconfig.DefaultPanelGitHubRepository
+	DisableImageGenerationOff         = internalconfig.DisableImageGenerationOff
+	DisableImageGenerationAll         = internalconfig.DisableImageGenerationAll
+	DisableImageGenerationChat        = internalconfig.DisableImageGenerationChat
+	DisableImageGenerationPassthrough = internalconfig.DisableImageGenerationPassthrough
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }
