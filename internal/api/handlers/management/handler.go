@@ -47,6 +47,7 @@ type Handler struct {
 	attemptsMu              sync.Mutex
 	failedAttempts          map[string]*attemptInfo // keyed by client IP
 	authManager             *coreauth.Manager
+	tokenStoreMu            sync.Mutex
 	tokenStore              coreauth.Store
 	localPassword           string
 	allowRemoteOverride     bool
@@ -148,6 +149,17 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Lock()
 	h.authManager = manager
 	h.mu.Unlock()
+}
+
+// SetTokenStore updates the handler-local store used for OAuth token persistence.
+// Passing nil restores the default store on the next persistence operation.
+func (h *Handler) SetTokenStore(store coreauth.Store) {
+	if h == nil {
+		return
+	}
+	h.tokenStoreMu.Lock()
+	h.tokenStore = store
+	h.tokenStoreMu.Unlock()
 }
 
 // SetPluginHost updates the plugin host used by plugin-backed management endpoints.
