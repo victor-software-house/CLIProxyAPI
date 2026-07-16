@@ -29,6 +29,19 @@ type handlerInterceptorNoStreamTestHost struct {
 	*handlerInterceptorTestHost
 }
 
+type handlerPluginExecutorStreamTestHost struct {
+	*handlerInterceptorTestHost
+	handlerDirectExecutorRouteHost
+	stream func(context.Context, string, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error)
+}
+
+func (h *handlerPluginExecutorStreamTestHost) ExecutePluginExecutorStream(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	h.lastPluginID = pluginID
+	h.lastRequest = req
+	h.lastOptions = opts
+	return h.stream(ctx, pluginID, req, opts)
+}
+
 func (h *handlerInterceptorNoStreamTestHost) HasStreamInterceptors() bool {
 	return false
 }
@@ -657,14 +670,78 @@ func TestHandlerStreamInterceptorRewritesAndDropsChunks(t *testing.T) {
 	}
 }
 
+func TestHandlerPluginExecutorStreamInitializesHeadersBeforeReturn(t *testing.T) {
+	model := "handler-plugin-executor-stream-header-before-return-model"
+	targetPluginID := "test-plugin-executor"
+	host := &handlerPluginExecutorStreamTestHost{
+		handlerInterceptorTestHost: &handlerInterceptorTestHost{
+			interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+				headers := cloneHeader(req.ResponseHeaders)
+				switch req.ChunkIndex {
+				case pluginapi.StreamChunkHeaderInitIndex:
+					headers.Set("X-Stage", "init")
+				case 0:
+					return pluginapi.StreamChunkInterceptResponse{Headers: headers, DropChunk: true}
+				case 1:
+					headers.Set("X-Initial", "deliver")
+				case 2:
+					headers.Set("X-Later", "must-not-reach-returned-headers")
+				}
+				return pluginapi.StreamChunkInterceptResponse{Headers: headers, Body: cloneBytes(req.Body)}
+			},
+		},
+		stream: func(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			if pluginID != targetPluginID {
+				t.Fatalf("plugin ID = %q, want %q", pluginID, targetPluginID)
+			}
+			chunks := make(chan coreexecutor.StreamChunk, 3)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("drop")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("deliver")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("later")}
+			close(chunks)
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	host.hasRouters = true
+	host.route = func(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+		return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetExecutor, Target: targetPluginID}, true
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{PassthroughHeaders: true}, nil)
+	handler.SetPluginHost(host)
+
+	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	if upstreamHeaders.Get("X-Initial") != "deliver" || upstreamHeaders.Get("X-Stage") != "init" {
+		t.Fatalf("upstream headers before stream consumption = %#v, want initialized delivered-payload headers", upstreamHeaders)
+	}
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if string(got) != "deliverlater" {
+		t.Fatalf("stream payload = %q, want deliverlater", got)
+	}
+	if upstreamHeaders.Get("X-Later") != "" {
+		t.Fatalf("upstream headers = %#v, must not be mutated by later stream work", upstreamHeaders)
+	}
+}
+
 func TestHandlerStreamInterceptorInitializesHeadersBeforeReturn(t *testing.T) {
 	model := "handler-interceptor-stream-header-before-return-model"
 	initStarted := make(chan struct{})
 	allowInit := make(chan struct{})
 	executor := &interceptorCaptureExecutor{
 		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
-			chunks := make(chan coreexecutor.StreamChunk, 1)
-			chunks <- coreexecutor.StreamChunk{Payload: []byte("payload")}
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("first")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("second")}
 			close(chunks)
 			return &coreexecutor.StreamResult{
 				Headers: http.Header{"X-Upstream": []string{"stream"}},
@@ -680,6 +757,8 @@ func TestHandlerStreamInterceptorInitializesHeadersBeforeReturn(t *testing.T) {
 				close(initStarted)
 				<-allowInit
 				headers.Set("X-Init", "plugin")
+			} else if req.ChunkIndex == 1 {
+				headers.Set("X-Later", "must-not-reach-returned-headers")
 			}
 			return pluginapi.StreamChunkInterceptResponse{
 				Headers: headers,
@@ -724,6 +803,9 @@ func TestHandlerStreamInterceptorInitializesHeadersBeforeReturn(t *testing.T) {
 		if msg != nil {
 			t.Fatalf("unexpected stream error: %+v", msg)
 		}
+	}
+	if upstreamHeaders.Get("X-Later") != "" {
+		t.Fatalf("upstream headers = %#v, must not be mutated by later stream work", upstreamHeaders)
 	}
 }
 
@@ -791,6 +873,72 @@ func TestAppendStreamInterceptorHistoryBoundsRetainedChunks(t *testing.T) {
 	}
 	if gotBytes := byteSlicesSize(history); gotBytes > maxStreamInterceptorHistoryBytes {
 		t.Fatalf("history bytes = %d, want <= %d", gotBytes, maxStreamInterceptorHistoryBytes)
+	}
+}
+
+func TestHandlerStreamInterceptorInitializesHeadersAfterDroppedPrelude(t *testing.T) {
+	model := "handler-interceptor-stream-dropped-prelude-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("drop")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("deliver")}
+			close(chunks)
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	var streamCalls int
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			streamCalls++
+			headers := cloneHeader(req.ResponseHeaders)
+			switch req.ChunkIndex {
+			case pluginapi.StreamChunkHeaderInitIndex:
+				headers.Set("X-Stage", "init")
+				return pluginapi.StreamChunkInterceptResponse{Headers: headers}
+			case 0:
+				if string(req.Body) != "drop" {
+					t.Fatalf("first chunk body = %q, want drop", req.Body)
+				}
+				return pluginapi.StreamChunkInterceptResponse{Headers: headers, DropChunk: true}
+			case 1:
+				if string(req.Body) != "deliver" {
+					t.Fatalf("second chunk body = %q, want deliver", req.Body)
+				}
+				if len(req.HistoryChunks) != 0 {
+					t.Fatalf("second chunk history = %#v, want no dropped chunk", req.HistoryChunks)
+				}
+				headers.Set("X-Initial", "second")
+				return pluginapi.StreamChunkInterceptResponse{Headers: headers, Body: cloneBytes(req.Body)}
+			default:
+				t.Fatalf("unexpected stream chunk index %d", req.ChunkIndex)
+				return pluginapi.StreamChunkInterceptResponse{}
+			}
+		},
+	})
+
+	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	if upstreamHeaders.Get("X-Initial") != "second" {
+		t.Fatalf("upstream headers = %#v, want second payload headers before return", upstreamHeaders)
+	}
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if string(got) != "deliver" {
+		t.Fatalf("stream payload = %q, want deliver", got)
+	}
+	if streamCalls != 3 {
+		t.Fatalf("stream interceptor calls = %d, want 3", streamCalls)
 	}
 }
 
